@@ -22,7 +22,14 @@ class TestEvaluateParagraphTextRecognizer(unittest.TestCase):
         dataset.setup()
 
         text_recog = ParagraphTextRecognizer()
-        trainer = pl.Trainer(gpus=1)
+        from pytorch_lightning import Trainer, seed_everything
+        seed_everything(42)
+        trainer = Trainer(
+            accelerator="auto",   # auto-picks MPS on Apple Silicon
+            devices=1,
+            max_epochs=10,
+            log_every_n_steps=10, # replaces progress_bar_refresh_rate
+        )
 
         start_time = time.time()
         metrics = trainer.test(text_recog.lit_model, datamodule=dataset)

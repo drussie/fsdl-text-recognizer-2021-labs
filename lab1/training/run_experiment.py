@@ -1,48 +1,76 @@
-"""Experiment-running framework."""
+#!/usr/bin/env python3
+"""Experiment-running framework (Lightning 2.x compatible)."""
+
 import argparse
 import importlib
-
 import numpy as np
 import torch
+import warnings
 import pytorch_lightning as pl
-import wandb
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.tuner import Tuner
 
 from text_recognizer import lit_models
 
-
-# In order to ensure reproducible experiments, we must set random seeds.
-np.random.seed(42)
-torch.manual_seed(42)
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.GradScaler.*")
+warnings.filterwarnings("ignore", message=".*device_type of 'cuda'.*")
+# Reproducibility
+# np.random.seed(42)
+# torch.manual_seed(42)
+# seed_everything(42, workers=True)
 
 
 def _import_class(module_and_class_name: str) -> type:
-    """Import class from a module, e.g. 'text_recognizer.models.MLP'"""
+    """Import class from a module, e.g. 'text_recognizer.models.MLP'."""
     module_name, class_name = module_and_class_name.rsplit(".", 1)
     module = importlib.import_module(module_name)
     class_ = getattr(module, class_name)
     return class_
 
 
-def _setup_parser():
-    """Set up Python's ArgumentParser with data, model, trainer, and other arguments."""
-    parser = argparse.ArgumentParser(add_help=False)
+def _resolve_lit_model_class(loss: str):
+    """Pick a LitModel class based on loss name, with BaseLitModel as fallback."""
+    if not loss:
+        return lit_models.BaseLitModel
+    lookup = {
+        "ctc": "CTCLitModel",
+        "transformer": "TransformerLitModel",
+    }
+    name = lookup.get(loss.lower())
+    return getattr(lit_models, name) if name and hasattr(lit_models, name) else lit_models.BaseLitModel
 
-    # Add Trainer specific arguments, such as --max_epochs, --gpus, --precision
-    trainer_parser = pl.Trainer.add_argparse_args(parser)
-    trainer_parser._action_groups[1].title = "Trainer Args"  # pylint: disable=protected-access
-    parser = argparse.ArgumentParser(add_help=False, parents=[trainer_parser])
 
-    # Basic arguments
+def _setup_parser() -> argparse.ArgumentParser:
+    """Set up ArgumentParser with trainer + data/model/litmodel args."""
+    parser = argparse.ArgumentParser(
+        description="FSDL Lab1 Runner (Lightning 2.x)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        add_help=False,
+    )
+
+    # ---- Trainer args (explicit; replaces add_argparse_args / from_argparse_args)
+    parser.add_argument("--max_epochs", type=int, default=10)
+    parser.add_argument("--accelerator", type=str, default="auto", help="auto/mps/cpu/gpu")
+    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--precision", type=str, default=None, help='e.g. "16-mixed"')
+    parser.add_argument("--log_every_n_steps", type=int, default=10)
+    parser.add_argument("--limit_train_batches", type=float, default=1.0)
+    parser.add_argument("--limit_val_batches", type=float, default=1.0)
+    parser.add_argument("--num_sanity_val_steps", type=int, default=2)
+    parser.add_argument("--auto_lr_find", action="store_true", help="Use PL Tuner to find LR before training")
+
+    # ---- Basic experiment args
     parser.add_argument("--data_class", type=str, default="MNIST")
     parser.add_argument("--model_class", type=str, default="MLP")
     parser.add_argument("--load_checkpoint", type=str, default=None)
 
-    # Get the data and model classes, so that we can add their specific arguments
+    # Parse partial to discover data/model classes, then extend parser
     temp_args, _ = parser.parse_known_args()
     data_class = _import_class(f"text_recognizer.data.{temp_args.data_class}")
     model_class = _import_class(f"text_recognizer.models.{temp_args.model_class}")
 
-    # Get data, model, and LitModel specific arguments
     data_group = parser.add_argument_group("Data Args")
     data_class.add_to_argparse(data_group)
 
@@ -52,6 +80,7 @@ def _setup_parser():
     lit_model_group = parser.add_argument_group("LitModel Args")
     lit_models.BaseLitModel.add_to_argparse(lit_model_group)
 
+    # Final help flag
     parser.add_argument("--help", "-h", action="help")
     return parser
 
@@ -60,44 +89,78 @@ def main():
     """
     Run an experiment.
 
-    Sample command:
-    ```
-    python training/run_experiment.py --max_epochs=3 --gpus='0,' --num_workers=20 --model_class=MLP --data_class=MNIST
-    ```
+    Example:
+        python -m lab1.training.run_experiment --max_epochs=3 --model_class=MLP --data_class=MNIST
     """
+    seed_everything(42, workers=True)
     parser = _setup_parser()
     args = parser.parse_args()
+
+    # Resolve classes
     data_class = _import_class(f"text_recognizer.data.{args.data_class}")
     model_class = _import_class(f"text_recognizer.models.{args.model_class}")
+
+    # Instantiate data & model
     data = data_class(args)
     model = model_class(data_config=data.config(), args=args)
 
-    if args.loss not in ("ctc", "transformer"):
-        lit_model_class = lit_models.BaseLitModel
+    # Choose LitModel (fallback to BaseLitModel if a specialized one isn't available)
+    # BaseLitModel.add_to_argparse typically adds `--loss`; handle gracefully if absent.
+    loss_name = getattr(args, "loss", None)
+    lit_model_class = _resolve_lit_model_class(loss_name)
 
-    if args.load_checkpoint is not None:
+    # Build / load Lightning module
+    if args.load_checkpoint:
         lit_model = lit_model_class.load_from_checkpoint(args.load_checkpoint, args=args, model=model)
     else:
         lit_model = lit_model_class(args=args, model=model)
 
-    logger = pl.loggers.TensorBoardLogger("training/logs")
+    # Logging & callbacks
+    logger = TensorBoardLogger(save_dir="training/logs", name="")
+    callbacks = [
+        EarlyStopping(monitor="val_loss", mode="min", patience=10),
+        ModelCheckpoint(
+            dirpath="training/logs",
+            filename="{epoch:03d}-{val_loss:.3f}-{val_cer:.3f}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+        ),
+        LearningRateMonitor(logging_interval="step"),
+    ]
 
-    early_stopping_callback = pl.callbacks.EarlyStopping(monitor="val_loss", mode="min", patience=10)
-    model_checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        filename="{epoch:03d}-{val_loss:.3f}-{val_cer:.3f}", monitor="val_loss", mode="min"
+    # Trainer (Lightning 2.x)
+    trainer = Trainer(
+        accelerator=args.accelerator,
+        devices=args.devices,
+        max_epochs=args.max_epochs,
+        precision=args.precision,
+        log_every_n_steps=args.log_every_n_steps,
+        limit_train_batches=args.limit_train_batches,
+        limit_val_batches=args.limit_val_batches,
+        num_sanity_val_steps=args.num_sanity_val_steps,
+        logger=logger,
+        callbacks=callbacks,
+        deterministic=True,
     )
-    callbacks = [early_stopping_callback, model_checkpoint_callback]
 
-    args.weights_summary = "full"  # Print full summary of the model
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, logger=logger, weights_save_path="training/logs")
+    # Optional: Auto LR finder via Tuner (replaces old Trainer(auto_lr_find=...))
+    if args.auto_lr_find:
+        tuner = Tuner(trainer)
+        lr_finder = tuner.lr_find(lit_model, datamodule=data)
+        new_lr = lr_finder.suggestion()
+        # Try common attribute names; ignore if not present
+        if hasattr(lit_model, "hparams") and hasattr(lit_model.hparams, "lr"):
+            lit_model.hparams.lr = new_lr
+        elif hasattr(lit_model, "lr"):
+            lit_model.lr = new_lr
+        elif hasattr(lit_model, "learning_rate"):
+            lit_model.learning_rate = new_lr
+        print(f"[auto_lr_find] Using suggested lr={new_lr}")
 
-    # pylint: disable=no-member
-    trainer.tune(lit_model, datamodule=data)  # If passing --auto_lr_find, this will set learning rate
-
+    # Train & test
     trainer.fit(lit_model, datamodule=data)
     trainer.test(lit_model, datamodule=data)
-    # pylint: enable=no-member
-
 
 
 if __name__ == "__main__":

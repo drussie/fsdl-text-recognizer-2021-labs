@@ -1,6 +1,7 @@
 import argparse
 import pytorch_lightning as pl
 import torch
+from torchmetrics.classification import MulticlassAccuracy
 
 
 OPTIMIZER = "Adam"
@@ -9,7 +10,10 @@ LOSS = "cross_entropy"
 ONE_CYCLE_TOTAL_STEPS = 100
 
 
-class Accuracy(pl.metrics.Accuracy):
+class Accuracy(MulticlassAccuracy):
+    def __init__(self, num_classes: int = 10, **kwargs):
+        super().__init__(num_classes=num_classes, **kwargs)
+
     """Accuracy Metric with a hack."""
 
     def update(self, preds: torch.Tensor, target: torch.Tensor) -> None:
@@ -47,10 +51,11 @@ class BaseLitModel(pl.LightningModule):  # pylint: disable=too-many-ancestors
         self.one_cycle_max_lr = self.args.get("one_cycle_max_lr", None)
         self.one_cycle_total_steps = self.args.get("one_cycle_total_steps", ONE_CYCLE_TOTAL_STEPS)
 
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy()
-        self.test_acc = Accuracy()
-
+        num_classes = getattr(model, "num_classes", 10)  # MNIST=10 by default
+        self.train_acc = Accuracy(num_classes=num_classes)
+        self.val_acc   = Accuracy(num_classes=num_classes)
+        self.test_acc  = Accuracy(num_classes=num_classes)
+        
     @staticmethod
     def add_to_argparse(parser):
         parser.add_argument("--optimizer", type=str, default=OPTIMIZER, help="optimizer class from torch.optim")

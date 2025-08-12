@@ -1,12 +1,9 @@
-from .util import BaseDataset
+# lab2/text_recognizer/data/__init__.py
 from .base_data_module import BaseDataModule
 from .mnist import MNIST
 
-# Hide lines below until Lab 2
-from .emnist import EMNIST
-from .emnist_lines import EMNISTLines
+__all__ = ["BaseDataModule", "MNIST"]
 
-# Hide lines above until Lab 2
 
 
 

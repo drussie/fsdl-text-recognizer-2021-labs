@@ -1,47 +1,66 @@
-"""MNIST DataModule"""
-import argparse
+#!/usr/bin/env python3
+"""MNIST DataModule compatible with Lightning 2.x + our BaseDataModule."""
 
+from pathlib import Path
+from typing import Optional
+
+import torch
 from torch.utils.data import random_split
-from torchvision.datasets import MNIST as TorchMNIST
-from torchvision import transforms
+from torchvision.datasets import MNIST as TVMNIST
+import torchvision.transforms as T
 
-from text_recognizer.data.base_data_module import BaseDataModule, load_and_print_info
-
-DOWNLOADED_DATA_DIRNAME = BaseDataModule.data_dirname() / "downloaded"
-
-# NOTE: temp fix until https://github.com/pytorch/vision/issues/1938 is resolved
-from six.moves import urllib  # pylint: disable=wrong-import-position, wrong-import-order
-
-opener = urllib.request.build_opener()
-opener.addheaders = [("User-agent", "Mozilla/5.0")]
-urllib.request.install_opener(opener)
+from .base_data_module import BaseDataModule, load_and_print_info
 
 
 class MNIST(BaseDataModule):
-    """
-    MNIST DataModule.
-    Learn more at https://pytorch-lightning.readthedocs.io/en/stable/extensions/datamodules.html
-    """
+    """MNIST digits (28x28 grayscale, 10 classes)."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args):
         super().__init__(args)
-        self.data_dir = DOWNLOADED_DATA_DIRNAME
-        self.transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-        self.dims = (1, 28, 28)  # dims are returned when calling `.size()` on this object.
-        self.output_dims = (1,)
-        self.mapping = list(range(10))
+        # validation fraction (of the official training split)
+        self.val_fraction: float = float(getattr(args, "val_fraction", 0.1))
+        # mapping for pretty printing / decodes
+        self.mapping = [str(i) for i in range(10)]
+        # cache the download root
+        self._root: Path = self.data_dir / "downloaded" / "MNIST"
 
-    def prepare_data(self, *args, **kwargs) -> None:
-        """Download train and test MNIST data from PyTorch canonical source."""
-        TorchMNIST(self.data_dir, train=True, download=True)
-        TorchMNIST(self.data_dir, train=False, download=True)
+    @classmethod
+    def add_to_argparse(cls, parser):
+        # inherit generic loader args from BaseDataModule
+        parser = super().add_to_argparse(parser)
+        group = parser.add_argument_group("MNIST Args")
+        group.add_argument("--val_fraction", type=float, default=0.1, help="Fraction of train set used for validation.")
+        return parser
 
-    def setup(self, stage=None) -> None:
-        """Split into train, val, test, and set dims."""
-        mnist_full = TorchMNIST(self.data_dir, train=True, transform=self.transform)
-        self.data_train, self.data_val = random_split(mnist_full, [55000, 5000])  # type: ignore
-        self.data_test = TorchMNIST(self.data_dir, train=False, transform=self.transform)
+    # -------- Lightning hooks --------
+    def prepare_data(self):
+        """Download once on a single process."""
+        TVMNIST(root=str(self._root), train=True, download=True)
+        TVMNIST(root=str(self._root), train=False, download=True)
 
+    def setup(self, stage: Optional[str] = None):
+        """Create train/val/test datasets."""
+        transform = T.ToTensor()
 
-if __name__ == "__main__":
-    load_and_print_info(MNIST)
+        full_train = TVMNIST(root=str(self._root), train=True, download=False, transform=transform)
+        n_total = len(full_train)
+        n_val = int(self.val_fraction * n_total)
+        n_train = n_total - n_val
+        self.train_dataset, self.val_dataset = random_split(
+            full_train, [n_train, n_val], generator=torch.Generator().manual_seed(42)
+        )
+
+        self.test_dataset = TVMNIST(root=str(self._root), train=False, download=False, transform=transform)
+
+        # optional: print a quick summary like the original labs
+        load_and_print_info(self.train_dataset, self.val_dataset, self.test_dataset, limit=0)
+
+    # -------- Model/config interface --------
+    def config(self):
+        """Small dict the model expects."""
+        return {
+            "input_dims": (1, 28, 28),   # channels, height, width
+            "num_classes": 10,
+            "output_dim": 10,            # alias some models look for
+            "mapping": self.mapping,
+        }

@@ -1,119 +1,175 @@
-"""Base DataModule class."""
-from pathlib import Path
-from typing import Collection, Dict, Optional, Tuple, Union
-import argparse
+#!/usr/bin/env python3
+"""
+Base DataModule with fast DataLoader defaults for Apple Silicon / Lightning 2.x.
 
-from torch.utils.data import ConcatDataset, DataLoader
+Includes backwards-compat helpers expected by older lab code:
+- BaseDataModule.data_dirname()
+- load_and_print_info(...)
+"""
+
+import os
+from pathlib import Path
+from typing import Optional, Any
+
 import pytorch_lightning as pl
+from torch.utils.data import DataLoader, Dataset
 
 from text_recognizer import util
-from text_recognizer.data.util import BaseDataset
-
-
-def load_and_print_info(data_module_class) -> None:
-    """Load EMNISTLines and print info."""
-    parser = argparse.ArgumentParser()
-    data_module_class.add_to_argparse(parser)
-    args = parser.parse_args()
-    dataset = data_module_class(args)
-    dataset.prepare_data()
-    dataset.setup()
-    print(dataset)
-
-
-def _download_raw_dataset(metadata: Dict, dl_dirname: Path) -> Path:
-    dl_dirname.mkdir(parents=True, exist_ok=True)
-    filename = dl_dirname / metadata["filename"]
-    if filename.exists():
-        return filename
-    print(f"Downloading raw dataset from {metadata['url']} to {filename}...")
-    util.download_url(metadata["url"], filename)
-    print("Computing SHA-256...")
-    sha256 = util.compute_sha256(filename)
-    if sha256 != metadata["sha256"]:
-        raise ValueError("Downloaded data file SHA-256 does not match that listed in metadata document.")
-    return filename
-
-
-BATCH_SIZE = 128
-NUM_WORKERS = 0
 
 
 class BaseDataModule(pl.LightningDataModule):
     """
-    Base DataModule.
-    Learn more at https://pytorch-lightning.readthedocs.io/en/stable/extensions/datamodules.html
+    Minimal base class most Lab 1 DataModules inherit from.
+
+    - Adds CLI args for batch size & DataLoader performance knobs
+    - Provides consistent train/val/test DataLoader builders
+
+    Subclasses are expected to set:
+      self.train_dataset / self.val_dataset / self.test_dataset
+    and optionally define a custom self.collate_fn or override hooks.
     """
 
-    def __init__(self, args: argparse.Namespace = None) -> None:
+    def __init__(self, args):
         super().__init__()
-        self.args = vars(args) if args is not None else {}
-        self.batch_size = self.args.get("batch_size", BATCH_SIZE)
-        self.num_workers = self.args.get("num_workers", NUM_WORKERS)
+        self.args = args
 
-        self.on_gpu = isinstance(self.args.get("gpus", None), (str, int))
+        # Generic knobs (with sensible defaults)
+        self.batch_size: int = int(getattr(args, "batch_size", 64))
+        self.num_workers: int = int(getattr(args, "num_workers", os.cpu_count() or 4) or 0)
+        self.prefetch_factor: int = int(getattr(args, "prefetch_factor", 4) or 2)
 
-        # Make sure to set the variables below in subclasses
-        self.dims: Tuple[int, ...]
-        self.output_dims: Tuple[int, ...]
-        self.mapping: Collection
-        self.data_train: Union[BaseDataset, ConcatDataset]
-        self.data_val: Union[BaseDataset, ConcatDataset]
-        self.data_test: Union[BaseDataset, ConcatDataset]
+        # Data root (Path). Prefer args.data_dir; otherwise use repo util.
+        self.data_dir: Path = Path(getattr(args, "data_dir", None) or self.data_dirname())
 
+        # Placeholders to be filled by subclasses in setup()
+        self.train_dataset: Optional[Dataset] = None
+        self.val_dataset: Optional[Dataset] = None
+        self.test_dataset: Optional[Dataset] = None
+
+        # Optional custom collate function (subclasses may override)
+        self.collate_fn = getattr(self, "collate_fn", None)
+
+    # ----- CLI args -----
     @classmethod
-    def data_dirname(cls):
-        return Path(__file__).resolve().parents[3] / "data"
-
-    @staticmethod
-    def add_to_argparse(parser):
-        parser.add_argument(
-            "--batch_size", type=int, default=BATCH_SIZE, help="Number of examples to operate on per forward step."
+    def add_to_argparse(cls, parser):
+        group = parser.add_argument_group("DataLoader Args")
+        group.add_argument("--batch_size", type=int, default=64, help="Per-device batch size.")
+        group.add_argument(
+            "--num_workers",
+            type=int,
+            default=os.cpu_count(),
+            help="torch DataLoader workers (>=8 recommended on M-series).",
         )
-        parser.add_argument(
-            "--num_workers", type=int, default=NUM_WORKERS, help="Number of additional processes to load data."
+        group.add_argument(
+            "--prefetch_factor",
+            type=int,
+            default=4,
+            help="Batches prefetched per worker (effective when num_workers > 0).",
+        )
+        group.add_argument(
+            "--data_dir",
+            type=str,
+            default=None,
+            help="Override dataset root directory (defaults to util.data_dirname()/data_dir).",
         )
         return parser
 
-    def config(self):
-        """Return important settings of the dataset, which will be passed to instantiate models."""
-        return {"input_dims": self.dims, "output_dims": self.output_dims, "mapping": self.mapping}
+    # ----- Back-compat helper (class method) -----
+    @classmethod
+    def data_dirname(cls) -> Path:
+        """
+        Back-compat: return the root data directory as a Path.
 
-    def prepare_data(self, *args, **kwargs) -> None:
+        Older labs expose util.data_dirname(); some repos expose util.data_dir().
+        Fallback to <cwd>/data if neither exists.
         """
-        Use this method to do things that might write to disk or that need to be done only from a single GPU
-        in distributed settings (so don't set state `self.x = y`).
-        """
+        if hasattr(util, "data_dirname"):
+            return Path(util.data_dirname())
+        if hasattr(util, "data_dir"):
+            return Path(util.data_dir())
+        return Path.cwd() / "data"
 
-    def setup(self, stage: Optional[str] = None) -> None:
-        """
-        Split into train, val, test, and set dims.
-        Should assign `torch Dataset` objects to self.data_train, self.data_val, and optionally self.data_test.
-        """
+    # ----- Optional hooks (subclasses typically override) -----
+    def prepare_data(self):
+        """Download/prepare data. Do not assign state here."""
+        pass
 
-    def train_dataloader(self):
-        return DataLoader(
-            self.data_train,
-            shuffle=True,
+    def setup(self, stage: Optional[str] = None):
+        """Create datasets. Subclasses should set train/val/test datasets here."""
+        pass
+
+    # ----- Internal helper for DataLoader kwargs -----
+    def _dl_kwargs(self, shuffle: bool = False):
+        kw = dict(
             batch_size=self.batch_size,
+            shuffle=shuffle,
+            pin_memory=True,  # still a good default with MPS
             num_workers=self.num_workers,
-            pin_memory=self.on_gpu,
+            collate_fn=self.collate_fn,
         )
+        if self.num_workers > 0:
+            kw.update(
+                persistent_workers=True,
+                prefetch_factor=self.prefetch_factor,
+            )
+        return kw
+
+    # ----- Standard Lightning hooks -----
+    def train_dataloader(self):
+        assert self.train_dataset is not None, "train_dataset not set in setup()"
+        return DataLoader(self.train_dataset, **self._dl_kwargs(shuffle=True))
 
     def val_dataloader(self):
-        return DataLoader(
-            self.data_val,
-            shuffle=False,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.on_gpu,
-        )
+        assert self.val_dataset is not None, "val_dataset not set in setup()"
+        return DataLoader(self.val_dataset, **self._dl_kwargs(shuffle=False))
 
     def test_dataloader(self):
-        return DataLoader(
-            self.data_test,
-            shuffle=False,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.on_gpu,
-        )
+        assert self.test_dataset is not None, "test_dataset not set in setup()"
+        return DataLoader(self.test_dataset, **self._dl_kwargs(shuffle=False))
+
+    # (Optional) some labs call this
+    def config(self):
+        """Subclasses usually override to return a dict with dataset-specific info."""
+        return {}
+
+
+# ---- Backwards-compat helper expected by older lab code ----
+
+def _shape_of(x: Any):
+    try:
+        return tuple(getattr(x, "shape", None) or [])
+    except Exception:
+        return None
+
+
+def load_and_print_info(*datasets, limit: int = 3):
+    """
+    Print quick stats about one or more datasets and return them unchanged.
+    Accepts (x, y) samples or single tensors/images.
+    Usage-compatible with older FSDL lab code that imported this helper.
+    """
+    for idx, ds in enumerate(datasets, 1):
+        name = getattr(ds, "__class__", type(ds)).__name__
+        try:
+            n = len(ds)  # may raise if not sized
+        except Exception:
+            n = "?"
+        print(f"[info] Dataset {idx}: {name} | size={n}")
+
+        # Peek a few samples if possible
+        if isinstance(n, int) and n > 0:
+            for i in range(min(limit, n)):
+                try:
+                    sample = ds[i]
+                except Exception:
+                    break
+                if isinstance(sample, (tuple, list)) and len(sample) >= 2:
+                    x, y = sample[0], sample[1]
+                    print(f"  - sample[{i}]: x_shape={_shape_of(x)} y={y}")
+                else:
+                    print(f"  - sample[{i}]: shape={_shape_of(sample)} type={type(sample).__name__}")
+
+    # Return exactly what was passed in, to preserve call sites
+    if len(datasets) == 1:
+        return datasets[0]
+    return datasets
