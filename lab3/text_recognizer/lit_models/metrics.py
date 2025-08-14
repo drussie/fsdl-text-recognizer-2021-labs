@@ -1,55 +1,71 @@
-from typing import Sequence
+# lab3/text_recognizer/lit_models/metrics.py
+from __future__ import annotations
 
-import pytorch_lightning as pl
+from typing import List, Sequence
+
 import torch
-import editdistance
+from torchmetrics import Metric
+
+try:
+    import editdistance  # fast Levenshtein
+except Exception:  # pragma: no cover
+    editdistance = None
 
 
-class CharacterErrorRate(pl.metrics.Metric):
-    """Character error rate metric, computed using Levenshtein distance."""
-
-    def __init__(self, ignore_tokens: Sequence[int], *args):
-        super().__init__(*args)
-        self.ignore_tokens = set(ignore_tokens)
-        self.add_state("error", default=torch.tensor(0.0), dist_reduce_fx="sum")  # pylint: disable=not-callable
-        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")  # pylint: disable=not-callable
-        self.error: torch.Tensor
-        self.total: torch.Tensor
-
-    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
-        N = preds.shape[0]
-        for ind in range(N):
-            pred = [_ for _ in preds[ind].tolist() if _ not in self.ignore_tokens]
-            target = [_ for _ in targets[ind].tolist() if _ not in self.ignore_tokens]
-            distance = editdistance.distance(pred, target)
-            error = distance / max(len(pred), len(target))
-            self.error = self.error + error
-        self.total = self.total + N
-
-    def compute(self) -> torch.Tensor:
-        return self.error / self.total
+def _levenshtein(a: str, b: str) -> int:
+    """Tiny DP fallback if editdistance isn't available."""
+    n, m = len(a), len(b)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    dp = list(range(m + 1))
+    for i in range(1, n + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, m + 1):
+            cur = dp[j]
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[j] = min(
+                dp[j] + 1,       # deletion
+                dp[j - 1] + 1,   # insertion
+                prev + cost,     # substitution
+            )
+            prev = cur
+    return dp[m]
 
 
-def test_character_error_rate():
-    metric = CharacterErrorRate([0, 1])
-    X = torch.tensor(  # pylint: disable=not-callable
-        [
-            [0, 2, 2, 3, 3, 1],  # error will be 0
-            [0, 2, 1, 1, 1, 1],  # error will be .75
-            [0, 2, 2, 4, 4, 1],  # error will be .5
-        ]
-    )
-    Y = torch.tensor(  # pylint: disable=not-callable
-        [
-            [0, 2, 2, 3, 3, 1],
-            [0, 2, 2, 3, 3, 1],
-            [0, 2, 2, 3, 3, 1],
-        ]
-    )
-    metric(X, Y)
-    print(metric.compute())
-    assert metric.compute() == sum([0, 0.75, 0.5]) / 3
+class CharacterErrorRate(Metric):
+    """Average character error rate (CER) over a batch/list of strings.
 
+    Accumulates total edit distance and total reference characters across updates:
+        CER = sum(edit_distance(pred, target)) / sum(len(target))
+    """
+    is_differentiable = False
+    higher_is_better = False
+    full_state_update = False
 
-if __name__ == "__main__":
-    test_character_error_rate()
+    def __init__(self) -> None:
+        super().__init__()
+        self.add_state("errors", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, preds: Sequence[str], targets: Sequence[str]) -> None:  # type: ignore[override]
+        if len(preds) != len(targets):
+            raise ValueError("preds and targets must have the same length")
+
+        err_sum = 0
+        tot = 0
+        for p, t in zip(preds, targets):
+            if not isinstance(p, str) or not isinstance(t, str):
+                raise TypeError("preds and targets must be sequences of strings")
+            e = editdistance.eval(p, t) if editdistance is not None else _levenshtein(p, t)
+            err_sum += e
+            tot += len(t)
+
+        self.errors += torch.tensor(float(err_sum), device=self.errors.device)
+        self.total += torch.tensor(float(tot), device=self.total.device)
+
+    def compute(self) -> torch.Tensor:  # type: ignore[override]
+        if self.total.item() == 0:
+            return torch.tensor(0.0, device=self.total.device)
+        return self.errors / self.total

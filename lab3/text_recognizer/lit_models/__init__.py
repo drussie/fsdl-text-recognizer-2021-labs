@@ -1,6 +1,9 @@
+# lab3/text_recognizer/lit_models/__init__.py
 from .base import BaseLitModel
-
-# Hide lines below until Lab 3
 from .ctc import CTCLitModel
 
-# Hide lines above until Lab 3
+
+try:
+    from .ctc import CTCLitModel  # legacy; not needed when using BaseLitModel + --loss=ctc_loss
+except Exception:  # pragma: no cover
+    CTCLitModel = None  # type: ignore
