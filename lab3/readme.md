@@ -1,5 +1,46 @@
 # Lab 3: Using CNN + LSTM with CTC loss for line text recognition
 
+# Marcos notes
+# Initialise and run using hte following sequence on Mac M3
+cd ~/Desktop/DeepLearning/UCBerkleyCourse/fsdl-text-recognizer-2021-labs
+
+# activate the right env in this shell
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate fsdl2021
+
+# make sure no shell alias masks the conda python
+unalias python 2>/dev/null || true
+unalias python3 2>/dev/null || true
+hash -r
+
+# verify we're using conda's python and that MPS is built/available
+python - <<'PY'
+import sys, torch
+print("python:", sys.executable)
+print("torch:", torch.__version__)
+print("mps built:", torch.backends.mps.is_built())
+print("mps available:", torch.backends.mps.is_available())
+PY
+
+# set env + module path
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+export PYTHONPATH="$PWD/lab3:$PWD"
+
+# run (MPS)
+python -m lab3.training.run_experiment \
+  --max_epochs=5 \
+  --data_class=sentence_generator.SentenceGenerator \
+  --model_class=LineCNNSimple \
+  --batch_size=128 --num_workers=8 --prefetch_factor=4 \
+  --accelerator=mps --devices=1 \
+  --loss=ctc_loss \
+  --line_image_height=28 \
+  --sentence_max_length=24 \
+  --output_timesteps=64
+
+# Marcos Notes ends
+# Course notes start below
+
 ## Goals
 
 - Introduce `LineCNNSimple`, a model that can read multiple characters in an image
