@@ -43,20 +43,20 @@ $env:PYTHONPATH = "$PWD\lab3;$PWD"
 
 # 4) train on the GPU with mixed precision
 python -m lab3.training.run_experiment `
-  --max_epochs=30 `
+  --max_epochs=40 `
   --data_class=sentence_generator.SentenceGenerator `
   --model_class=LineCNNSimple `
-  --batch_size=512 `
+  --batch_size=256 `
   --num_workers=16 `
   --prefetch_factor=4 `
-  --accelerator=gpu `
-  --devices=1 `
+  --accelerator=gpu --devices=1 `
   --precision=16-mixed `
   --loss=ctc_loss `
   --line_image_height=28 `
   --sentence_max_length=24 `
-  --output_timesteps=64
-
+  --output_timesteps=64 `
+  --conv_dim=128 `
+  --fc_dim=256
 
 # Check GPU usage and other stats
 while ($true) {

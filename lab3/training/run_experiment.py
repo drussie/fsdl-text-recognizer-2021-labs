@@ -1,6 +1,9 @@
-# lab3/training/run_experiment.py
-# Works with modern PyTorch Lightning; supports SentenceGenerator by rendering
-# on-the-fly into line images and encoding labels. Adds <BLANK> for CTC.
+# lab3/training/run_experiment.py — drop‑in replacement (Windows/CUDA & macOS/MPS safe)
+# Compatible with PyTorch Lightning ≥2.x
+# - Works with synthetic SentenceGenerator by rendering on the fly to 1×H×W images
+# - CTC-ready: mapping includes <BLANK> as last class; labels padded with -1
+# - DataLoader knobs set safely for Windows/macOS (persistent_workers, prefetch_factor)
+# - Fixes Windows multiprocessing pickling when invoked oddly by forcing a stable module path
 
 from __future__ import annotations
 
@@ -8,8 +11,10 @@ import argparse
 import importlib
 import math
 import os
+import random
+import sys
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -19,9 +24,18 @@ from PIL import Image, ImageDraw, ImageFont
 
 import pytorch_lightning as pl
 
-# ---------------- Utils ----------------
+# --------------------------------------------------------------------------------------
+# Repro & small quality-of-life
+# --------------------------------------------------------------------------------------
 
 def _seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
     try:
         pl.seed_everything(seed, workers=True)
     except Exception:
@@ -34,18 +48,28 @@ def _import_class(qualname: str):
     return getattr(importlib.import_module(module), cls)
 
 
-# ---------------- Simple text -> image helpers ----------------
+# --------------------------------------------------------------------------------------
+# Simple text → image helpers
+# --------------------------------------------------------------------------------------
 
 def _render_line_gray(text: str, *, height: int = 28, pad_w: int = 8) -> Image.Image:
     """Render a single-line grayscale image (white background, black text)."""
-    font = ImageFont.load_default()
-    # measure with textbbox (new API)
+    # Use a default font; if truetype available, PIL will pick it up for textbbox
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+
+    # Measure with textbbox (newer PIL) and scale width to requested height
     dummy = Image.new("L", (1, 1), 255)
     d = ImageDraw.Draw(dummy)
-    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
-    w0, h0 = right - left, bottom - top
+    # Fallback to textsize if textbbox missing
+    if hasattr(d, "textbbox"):
+        left, top, right, bottom = d.textbbox((0, 0), text, font=font)
+        w0, h0 = right - left, bottom - top
+    else:
+        w0, h0 = d.textsize(text, font=font)
 
-    # scale width roughly to requested height
     scale = max(1.0, (height - 4) / max(1, h0))
     w = int(max(1, math.ceil(w0 * scale))) + 2 * pad_w
     img = Image.new("L", (w, height), 255)
@@ -61,7 +85,10 @@ def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
     t = torch.from_numpy(arr).float() / 255.0
     return t.unsqueeze(0)  # (1, H, W)
 
-# ---------------- Synthetic dataset from SentenceGenerator ----------------
+
+# --------------------------------------------------------------------------------------
+# Synthetic dataset from SentenceGenerator (returns (image_tensor, label_tensor))
+# --------------------------------------------------------------------------------------
 
 @dataclass
 class _GenCfg:
@@ -102,12 +129,22 @@ class RenderedLinesFromGenerator(Dataset):
                 x = _pil_to_tensor(img)  # (1,H,W)
                 y = self._encode(s)      # (L,)
                 return x, y
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 last_err = e
         raise RuntimeError(f"SentenceGenerator kept failing; last error: {repr(last_err)}")
 
 
-# ---------------- Collate: pad images and labels ----------------
+# Make sure this class pickles under a stable import path even if someone uses runpy/run_name='__main__'
+try:
+    RenderedLinesFromGenerator.__module__ = "lab3.training.run_experiment"
+    sys.modules.setdefault("lab3.training.run_experiment", sys.modules[__name__])
+except Exception:
+    pass
+
+
+# --------------------------------------------------------------------------------------
+# Collate: pad images and labels
+# --------------------------------------------------------------------------------------
 
 def _pad_and_pack(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]], ignore_index: int = -1):
     xs, ys = zip(*batch)
@@ -125,15 +162,19 @@ def _pad_and_pack(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]], ignore_ind
     return xbat, ybat   # ybat is LongTensor padded with -1
 
 
-# ---------------- Loader kwargs ----------------
+# --------------------------------------------------------------------------------------
+# Loader kwargs
+# --------------------------------------------------------------------------------------
 
 def _loader_kwargs(args, *, is_train: bool):
     nw = int(getattr(args, "num_workers", 0) or 0)
+    # Pin memory only really helps on CUDA
+    use_pin = torch.cuda.is_available() and ((args.accelerator or "").lower() in ("gpu", "cuda", "auto", ""))
     kw = dict(
         batch_size=int(args.batch_size),
         shuffle=bool(is_train),
         num_workers=nw,
-        pin_memory=False,
+        pin_memory=use_pin,
         persistent_workers=(nw > 0),
         drop_last=False,
         collate_fn=_pad_and_pack,
@@ -144,7 +185,9 @@ def _loader_kwargs(args, *, is_train: bool):
     return kw
 
 
-# ---------------- Config + mapping helpers ----------------
+# --------------------------------------------------------------------------------------
+# Config + mapping helpers
+# --------------------------------------------------------------------------------------
 
 def _alphabet_default() -> List[str]:
     import string
@@ -156,7 +199,8 @@ def _alphabet_default() -> List[str]:
 
 def _build_data_config(args, *, mapping: List[str], sample_x: torch.Tensor) -> dict:
     H, W = sample_x.shape[-2], sample_x.shape[-1]
-    T_est = max(8, W // 4)  # rough width downsample of ~4x for LineCNNs
+    # Heuristic: width downsample ~4x for LineCNNs → estimate default timesteps
+    T_est = max(8, W // 4)
     T = int(getattr(args, "output_timesteps", T_est) or T_est)
     return {
         "input_dims": (1, H, W),
@@ -167,7 +211,9 @@ def _build_data_config(args, *, mapping: List[str], sample_x: torch.Tensor) -> d
     }
 
 
-# ---------------- CLI ----------------
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
 
 def _setup_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
@@ -208,12 +254,15 @@ def _setup_parser() -> argparse.ArgumentParser:
     return p
 
 
-# ---------------- Main ----------------
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
 
 def main():
     _seed_everything(42)
     args = _setup_parser().parse_args()
 
+    # Helpful message for MPS + CTC
     if (args.accelerator or "").lower() == "mps" and args.loss == "ctc_loss":
         if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "1":
             print("[warn] Using MPS with CTC. Consider `export PYTORCH_ENABLE_MPS_FALLBACK=1`.")
@@ -223,12 +272,15 @@ def main():
     if "." not in dc or not dc.startswith("text_recognizer."):
         dc = f"text_recognizer.data.{dc}"
     data_cls = _import_class(dc)
-    data_obj = data_cls()  # SentenceGenerator() typically takes no args
+    # Some data classes accept args; SentenceGenerator typically does not need them
+    try:
+        data_obj = data_cls()
+    except TypeError:
+        data_obj = data_cls(args)
 
     # Build mapping and datasets
-    mapping = _alphabet_default()                         # [..., "<UNK>", "<BLANK>"]
-    gen_cfg = _GenCfg(img_height=int(args.line_image_height),
-                      max_length=int(args.sentence_max_length))
+    mapping = _alphabet_default()  # [..., "<UNK>", "<BLANK>"]
+    gen_cfg = _GenCfg(img_height=int(args.line_image_height), max_length=int(args.sentence_max_length))
     train_ds = RenderedLinesFromGenerator(data_obj, length=20000, cfg=gen_cfg, mapping=mapping)
     val_ds   = RenderedLinesFromGenerator(data_obj, length=2000,  cfg=gen_cfg, mapping=mapping)
     test_ds  = RenderedLinesFromGenerator(data_obj, length=2000,  cfg=gen_cfg, mapping=mapping)
@@ -248,9 +300,10 @@ def main():
     model_cls = _import_class(mc)
     model = model_cls(data_config=data_config, args=args)
 
-    # Lightning wrapper (our BaseLitModel handles both CE and CTC)
+    # Lightning wrapper (CTC vs CE)
     from text_recognizer import lit_models
-    lit_model = lit_models.BaseLitModel(args=args, model=model)
+    lit_model_cls = lit_models.CTCLitModel if args.loss == "ctc_loss" and hasattr(lit_models, "CTCLitModel") else lit_models.BaseLitModel
+    lit_model = lit_model_cls(args=args, model=model)
 
     # Loaders
     train_loader = DataLoader(train_ds, **_loader_kwargs(args, is_train=True))
@@ -279,4 +332,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # On Windows, prefer calling as a module: `python -m lab3.training.run_experiment ...`
+    # The class/module alias above makes child workers happy even if someone uses runpy.
     main()
